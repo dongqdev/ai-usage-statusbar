@@ -1,5 +1,6 @@
-﻿const vscode = require('vscode');
+const vscode = require('vscode');
 const { exec } = require('child_process');
+const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const os = require('os');
@@ -9,7 +10,6 @@ const CODEX_ICON = '$(pulse)';
 const CLAUDE_ICON = '$(sparkle)';
 const COPILOT_ICON = '$(github)';
 const GEMINI_ICON = '$(hubot)';
-const KIMI_ICON = '$(moon)';
 const STATUS_BAR_LANGUAGE = 'en';
 const WEEKLY_LOW_PERCENT_THRESHOLD = 5;
 const AUTO_REFRESH_INTERVAL_MS = 60 * 1000;
@@ -21,8 +21,6 @@ const OPENAI_WEB_TIMEOUT_MS = 12000;
 const CLAUDE_SESSION_WINDOW_MS = 5 * 60 * 60 * 1000; // 5 hours
 const CLAUDE_PLAN_TOKEN_LIMITS = { pro: 44000, max_5: 88000, max5: 88000, max_20: 220000, max20: 220000, team: 44000 };
 const GEMINI_TIMEOUT_MS = 12000;
-const KIMI_TIMEOUT_MS = 8000;
-const KIMI_API_BASE = 'https://api.kimi.com/coding/v1';
 const GEMINI_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const GEMINI_CODE_ASSIST_ENDPOINT = '/v1internal:loadCodeAssist';
 const GEMINI_QUOTA_ENDPOINT = '/v1internal:retrieveUserQuota';
@@ -48,20 +46,18 @@ function activate(context) {
   const claudeItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
   const copilotItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 98);
   const geminiItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 97);
-  const kimiItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 96);
   codexItem.color = '#4fc1ff';
   claudeItem.color = '#f48771';
   copilotItem.color = '#4ec9b0';
   geminiItem.color = '#d7ba7d';
-  kimiItem.color = '#c586c0';
 
   let timer = null;
   let panel = null;
-  let lastResults = { codex: null, claude: null, copilot: null, gemini: null, kimi: null };
+  let lastResults = { codex: null, claude: null, copilot: null, gemini: null };
   let copilotStartupRetryScheduled = false;
   let allRefreshInFlight = null;
-  const providerRefreshInFlight = { codex: null, claude: null, copilot: null, gemini: null, kimi: null };
-  const refreshState = { all: false, providers: { codex: false, claude: false, copilot: false, gemini: false, kimi: false } };
+  const providerRefreshInFlight = { codex: null, claude: null, copilot: null, gemini: null };
+  const refreshState = { all: false, providers: { codex: false, claude: false, copilot: false, gemini: false } };
   let refreshSequence = 0;
   void ensureInitialLanguageSetting();
 
@@ -69,19 +65,16 @@ function activate(context) {
   claudeItem.command = 'codexUsage.refreshClaude';
   copilotItem.command = 'codexUsage.refreshCopilot';
   geminiItem.command = 'codexUsage.refreshGemini';
-  kimiItem.command = 'codexUsage.refreshKimi';
   // 초기 로딩: 아이콘 + 스피너 (이후 새로고침 시에는 이전 데이터를 유지)
   codexItem.text = `${CODEX_ICON} $(sync~spin)`;
   claudeItem.text = `${CLAUDE_ICON} $(sync~spin)`;
   copilotItem.text = `${COPILOT_ICON} $(sync~spin)`;
   geminiItem.text = `${GEMINI_ICON} $(sync~spin)`;
-  kimiItem.text = `${KIMI_ICON} $(sync~spin)`;
   const cfg0 = getConfig();
   if (cfg0.codexEnabled) codexItem.show();
   if (cfg0.claudeEnabled) claudeItem.show();
   if (cfg0.copilotEnabled) copilotItem.show();
   if (cfg0.geminiEnabled) geminiItem.show();
-  if (cfg0.kimiEnabled) kimiItem.show();
 
   const emitRefreshState = () => {
     panel?.postRefreshState({
@@ -154,16 +147,6 @@ function activate(context) {
         geminiItem.hide();
       }
       lastResults.gemini = result;
-    } else if (provider === 'kimi') {
-      if (result) {
-        if (!result.ok) output.appendLine(`[error:kimi] ${result.error}`);
-        kimiItem.text = `${KIMI_ICON} ${result.ok ? buildStatusBarTextEn(result) : '-'}`;
-        kimiItem.tooltip = buildProviderTooltip('Kimi', KIMI_ICON, result);
-        kimiItem.show();
-      } else {
-        kimiItem.hide();
-      }
-      lastResults.kimi = result;
     }
     panel?.postResults(lastResults);
   };
@@ -188,7 +171,7 @@ function activate(context) {
           ? cfg.copilotEnabled
           : provider === 'gemini'
             ? cfg.geminiEnabled
-            : cfg.kimiEnabled;
+            : false;
     if (!enabled) {
       output.appendLine(`[refresh:${refreshId}] ${provider} skipped (disabled)`);
       applyProviderResult(provider, null);
@@ -207,7 +190,6 @@ function activate(context) {
         else if (provider === 'claude') result = await fetchClaudeUsage(output);
         else if (provider === 'copilot') result = await fetchCopilotUsage(output);
         else if (provider === 'gemini') result = await fetchGeminiUsage(output);
-        else result = await fetchKimiUsage(output);
       } catch (err) {
         result = { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
@@ -265,7 +247,6 @@ function activate(context) {
         runProviderRefresh('claude', { refreshId, allowWhenAll: true }),
         runProviderRefresh('copilot', { refreshId, allowWhenAll: true }),
         runProviderRefresh('gemini', { refreshId, allowWhenAll: true }),
-        runProviderRefresh('kimi', { refreshId, allowWhenAll: true }),
       ]);
 
       output.appendLine(`[refresh:${refreshId}] done (${Date.now() - startedAt}ms)`);
@@ -373,16 +354,6 @@ function activate(context) {
         geminiItem.hide();
       }
 
-      if (cfg.kimiEnabled) {
-        if (lastResults.kimi) {
-          kimiItem.text = `${KIMI_ICON} ${lastResults.kimi.ok ? buildStatusBarTextEn(lastResults.kimi) : '-'}`;
-          kimiItem.tooltip = buildProviderTooltip('Kimi', KIMI_ICON, lastResults.kimi);
-        }
-        kimiItem.show();
-      } else {
-        kimiItem.hide();
-      }
-
       panel?.postResults(lastResults);
       emitRefreshState();
       return;
@@ -392,8 +363,7 @@ function activate(context) {
       !e.affectsConfiguration('codexUsage') &&
       !e.affectsConfiguration('claudeUsage') &&
       !e.affectsConfiguration('copilotUsage') &&
-      !e.affectsConfiguration('geminiUsage') &&
-      !e.affectsConfiguration('kimiUsage')
+      !e.affectsConfiguration('geminiUsage')
     ) {
       return;
     }
@@ -417,9 +387,6 @@ function activate(context) {
   const refreshGeminiCmd = vscode.commands.registerCommand('codexUsage.refreshGemini', async () => {
     await runProviderRefresh('gemini');
   });
-  const refreshKimiCmd = vscode.commands.registerCommand('codexUsage.refreshKimi', async () => {
-    await runProviderRefresh('kimi');
-  });
   const refreshGeminiFromCacheCmd = vscode.commands.registerCommand('codexUsage.refreshGeminiFromCache', async () => {
     const cfg = getConfig();
     output.appendLine(
@@ -439,14 +406,12 @@ function activate(context) {
     claudeItem,
     copilotItem,
     geminiItem,
-    kimiItem,
     output,
     refreshCmd,
     refreshCodexCmd,
     refreshClaudeCmd,
     refreshCopilotCmd,
     refreshGeminiCmd,
-    refreshKimiCmd,
     refreshGeminiFromCacheCmd,
     openOutputCmd,
     onConfigChanged,
@@ -767,7 +732,7 @@ class SettingsPanelProvider {
         const r = this._getLastResults?.();
         if (r) this.postResults(r);
         // 첫 로드 시 캐시가 비어 있으면 즉시 1회 새로고침하여 로딩 고착 방지
-        if (!r || (!r.codex && !r.claude && !r.copilot && !r.gemini && !r.kimi)) {
+        if (!r || (!r.codex && !r.claude && !r.copilot && !r.gemini)) {
           vscode.commands.executeCommand('codexUsage.refresh');
         }
       } else if (msg.type === 'refresh') {
@@ -778,7 +743,6 @@ class SettingsPanelProvider {
         else if (provider === 'claude') vscode.commands.executeCommand('codexUsage.refreshClaude');
         else if (provider === 'copilot') vscode.commands.executeCommand('codexUsage.refreshCopilot');
         else if (provider === 'gemini') vscode.commands.executeCommand('codexUsage.refreshGemini');
-        else if (provider === 'kimi') vscode.commands.executeCommand('codexUsage.refreshKimi');
       }
     }, undefined, this._context.subscriptions);
 
@@ -978,13 +942,6 @@ class SettingsPanelProvider {
       <span class="dot dot-yellow"></span>Gemini
     </label>
   </div>
-  <div class="item" onclick="toggleCheck('kimi')">
-    <input type="checkbox" id="kimi" ${chk(cfg.kimiEnabled)}
-      onclick="event.stopPropagation(); toggle('kimiUsage.enabled', this.checked)">
-    <label for="kimi" onclick="event.preventDefault()">
-      <span class="dot" style="background:#c586c0"></span>Kimi
-    </label>
-  </div>
 </div>
 
 <!-- 사용량 -->
@@ -1047,9 +1004,9 @@ class SettingsPanelProvider {
 <script>
 const vscode = acquireVsCodeApi();
 const T = ${JSON.stringify(t)};
-const INITIAL_RESULTS = ${JSON.stringify(this._getLastResults?.() || { codex: null, claude: null, copilot: null, gemini: null, kimi: null })};
+const INITIAL_RESULTS = ${JSON.stringify(this._getLastResults?.() || { codex: null, claude: null, copilot: null, gemini: null })};
 let CURRENT_RESULTS = INITIAL_RESULTS;
-let REFRESH_STATE = { all: false, providers: { codex: false, claude: false, copilot: false, gemini: false, kimi: false } };
+let REFRESH_STATE = { all: false, providers: { codex: false, claude: false, copilot: false, gemini: false } };
 
 function toggle(key, value) { vscode.postMessage({ type: 'update', key, value }); }
 function update(key, value) { vscode.postMessage({ type: 'update', key, value }); }
@@ -1073,14 +1030,13 @@ function setButtonRefreshing(btnId, labelId, refreshing, baseText) {
   else btn.classList.remove('refreshing');
 }
 function setRefreshingState(state) {
-  REFRESH_STATE = state || { all: false, providers: { codex: false, claude: false, copilot: false, gemini: false, kimi: false } };
+  REFRESH_STATE = state || { all: false, providers: { codex: false, claude: false, copilot: false, gemini: false } };
   const p = REFRESH_STATE.providers || {};
   setButtonRefreshing('refresh-btn', 'refresh-label', !!REFRESH_STATE.all, T.refreshNow);
   setButtonRefreshing('refresh-btn-codex', 'refresh-label-codex', !!REFRESH_STATE.all || !!p.codex, T.refreshNow);
   setButtonRefreshing('refresh-btn-claude', 'refresh-label-claude', !!REFRESH_STATE.all || !!p.claude, T.refreshNow);
   setButtonRefreshing('refresh-btn-copilot', 'refresh-label-copilot', !!REFRESH_STATE.all || !!p.copilot, T.refreshNow);
   setButtonRefreshing('refresh-btn-gemini', 'refresh-label-gemini', !!REFRESH_STATE.all || !!p.gemini, T.refreshNow);
-  setButtonRefreshing('refresh-btn-kimi', 'refresh-label-kimi', !!REFRESH_STATE.all || !!p.kimi, T.refreshNow);
 }
 function toggleCheck(id) {
   const el = document.getElementById(id);
@@ -1089,7 +1045,6 @@ function toggleCheck(id) {
     codex: 'codexUsage.enabled', claude: 'claudeUsage.enabled',
     copilot: 'copilotUsage.enabled',
     gemini: 'geminiUsage.enabled',
-    kimi: 'kimiUsage.enabled',
     geminiFlashLite: 'geminiUsage.showFlashLite',
     geminiFlash: 'geminiUsage.showFlash',
     geminiPro: 'geminiUsage.showPro',
@@ -1219,7 +1174,6 @@ function renderUsage(data) {
   if (isProviderEnabled('claude')) html += cardHtml('dot-red','Claude',d.claude);
   if (isProviderEnabled('copilot')) html += cardHtml('dot-green','Copilot',d.copilot);
   if (isProviderEnabled('gemini')) html += cardHtml('dot-yellow','Gemini',d.gemini);
-  if (isProviderEnabled('kimi')) html += cardHtml('dot-purple','Kimi',d.kimi);
   area.innerHTML = html || '<div class="usage-text">' + T.noData + '</div>';
 }
 
@@ -1280,9 +1234,6 @@ function getConfig() {
     geminiShowFlashLite: getGeminiToggleValue(config, 'geminiUsage.showFlashLite', true),
     geminiShowFlash: getGeminiToggleValue(config, 'geminiUsage.showFlash', true),
     geminiShowPro: getGeminiToggleValue(config, 'geminiUsage.showPro', true),
-    kimiEnabled: config.get('kimiUsage.enabled', true),
-    kimiCredentialsPath: config.get('kimiUsage.credentialsPath', '~/.kimi/credentials/kimi-code.json'),
-    kimiCommandTimeoutMs: config.get('kimiUsage.commandTimeoutMs', 8000),
     source: config.get('codexUsage.source', 'auto'),
     command: config.get('codexUsage.command', 'codex usage'),
     commandTimeoutMs: config.get('codexUsage.commandTimeoutMs', 10000),
@@ -1343,7 +1294,7 @@ async function fetchUsageFromOpenAIWeb(output) {
       return { ok: false, error: 'OpenAI OAuth token expired in OpenCode auth.json' };
     }
 
-    const accountId = extractChatGptAccountId(auth.access);
+    const accountId = auth.account_id || extractChatGptAccountId(auth.access);
     output.appendLine('[run:openai-web] GET /backend-api/wham/usage');
     const headers = {
       Authorization: `Bearer ${auth.access}`,
@@ -1514,14 +1465,48 @@ async function fetchClaudeUsage(output) {
   }
 }
 
+function loadClaudeCredentials(output) {
+  const credPath = path.join(os.homedir(), '.claude', '.credentials.json');
+  if (fs.existsSync(credPath)) {
+    try {
+      return JSON.parse(fs.readFileSync(credPath, 'utf8'));
+    } catch (e) {
+      output?.appendLine?.(`[warn:claude] Failed to parse ${credPath}: ${e}`);
+    }
+  }
+
+  if (process.platform === 'darwin') {
+    const { execSync } = require('child_process');
+    const services = ['Claude Code-credentials', 'claude-code', 'Claude Code'];
+    for (const service of services) {
+      try {
+        const stdout = execSync(`security find-generic-password -s "${service}" -w 2>/dev/null`, {
+          encoding: 'utf8',
+          timeout: 2000,
+        }).trim();
+        if (stdout) {
+          const parsed = JSON.parse(stdout);
+          if (parsed?.claudeAiOauth?.accessToken) {
+            output?.appendLine?.(`[info:claude] Loaded credentials from macOS Keychain (${service})`);
+            return parsed;
+          }
+        }
+      } catch (_e) {
+        // Ignored
+      }
+    }
+  }
+  return null;
+}
+
 async function fetchClaudeUsageFromOauth(output) {
   try {
+    const cred = loadClaudeCredentials(output);
+    if (!cred) {
     const credPath = path.join(os.homedir(), '.claude', '.credentials.json');
-    if (!fs.existsSync(credPath)) {
-      return { ok: false, error: `Missing ${credPath}` };
+      return { ok: false, error: `Missing ${credPath} and Keychain credentials` };
     }
 
-    const cred = JSON.parse(fs.readFileSync(credPath, 'utf8'));
     const token = cred?.claudeAiOauth?.accessToken;
     if (!token) {
       return { ok: false, error: 'No Claude OAuth access token in credentials' };
@@ -1544,14 +1529,32 @@ async function fetchClaudeUsageFromOauth(output) {
       'anthropic-beta': 'oauth-2025-04-20',
     }, CLAUDE_OAUTH_TIMEOUT_MS);
 
+    let primaryUtil = data?.five_hour?.utilization;
+    let primaryReset = data?.five_hour?.resets_at;
+    let secondaryUtil = data?.seven_day?.utilization;
+    let secondaryReset = data?.seven_day?.resets_at;
+
+    if (Array.isArray(data?.limits)) {
+      const sessionLimit = data.limits.find(l => l.kind === 'session' || l.group === 'session');
+      if (sessionLimit) {
+        if (primaryUtil === undefined && typeof sessionLimit.percent === 'number') primaryUtil = sessionLimit.percent;
+        if (!primaryReset && sessionLimit.resets_at) primaryReset = sessionLimit.resets_at;
+      }
+      const weeklyLimit = data.limits.find(l => l.kind === 'weekly_all' || l.kind === 'weekly' || l.group === 'weekly');
+      if (weeklyLimit) {
+        if (secondaryUtil === undefined && typeof weeklyLimit.percent === 'number') secondaryUtil = weeklyLimit.percent;
+        if (!secondaryReset && weeklyLimit.resets_at) secondaryReset = weeklyLimit.resets_at;
+      }
+    }
+
     const rateLimits = {
       primary: {
-        used_percent: normalizeUtilizationToUsedPercent(data?.five_hour?.utilization),
-        resets_at: isoToEpochSeconds(data?.five_hour?.resets_at),
+        used_percent: normalizeUtilizationToUsedPercent(primaryUtil),
+        resets_at: isoToEpochSeconds(primaryReset),
       },
       secondary: {
-        used_percent: normalizeUtilizationToUsedPercent(data?.seven_day?.utilization),
-        resets_at: isoToEpochSeconds(data?.seven_day?.resets_at),
+        used_percent: normalizeUtilizationToUsedPercent(secondaryUtil),
+        resets_at: isoToEpochSeconds(secondaryReset),
       },
     };
 
@@ -1699,8 +1702,237 @@ async function fetchCopilotUsageFromGithub(output) {
   }
 }
 
+async function fetchAntigravityLocalQuota(output) {
+  try {
+    const proc = await detectAntigravityProcess(output);
+    if (!proc || !proc.csrfToken) {
+      output?.appendLine('[gemini:local] Antigravity process/CSRF token not found');
+      return null;
+    }
+
+    const ports = await getListeningPortsForPid(proc.pid, proc.extensionPort, output);
+    output?.appendLine(`[gemini:local] testing listening ports: ${ports.join(', ')}`);
+
+    for (const port of ports) {
+      const res = await requestAntigravityGetUserStatus(port, proc.csrfToken);
+      if (res.ok && res.data?.userStatus) {
+        output?.appendLine(`[gemini:local] successfully retrieved userStatus on port ${port}`);
+        const configs = res.data.userStatus.cascadeModelConfigData?.clientModelConfigs || [];
+        const geminiConfigs = configs.filter(c => c.quotaInfo && (
+          (c.label && c.label.toLowerCase().includes('gemini')) ||
+          (c.modelOrAlias?.model && c.modelOrAlias.model.toLowerCase().includes('gemini'))
+        ));
+
+        const categories = [
+          { id: 'pro', shortLabel: 'P', label: 'Pro', matches: (lbl, id) => lbl.includes('pro') || id.includes('pro') },
+          { id: 'flash', shortLabel: 'F', label: 'Flash', matches: (lbl, id) => (lbl.includes('flash') || id.includes('flash')) && !lbl.includes('lite') && !id.includes('lite') },
+          { id: 'flash-lite', shortLabel: 'FL', label: 'Flash Lite', matches: (lbl, id) => lbl.includes('lite') || id.includes('lite') },
+        ];
+
+        const models = [];
+        for (const cat of categories) {
+          const matched = geminiConfigs.filter(c => {
+            const lbl = (c.label || '').toLowerCase();
+            const id = (c.modelOrAlias?.model || '').toLowerCase();
+            return cat.matches(lbl, id);
+          });
+
+          if (matched.length === 0) {
+            models.push({ id: cat.id, shortLabel: cat.shortLabel, label: cat.label, leftPercent: null, resetsAt: null });
+          } else {
+            const items = matched.map(c => {
+              const frac = c.quotaInfo.remainingFraction ?? 0;
+              const left = Math.max(0, Math.min(100, Math.round(frac * 1000) / 10));
+              return {
+                leftPercent: left,
+                resetsAt: isoToEpochSeconds(c.quotaInfo.resetTime)
+              };
+            });
+            items.sort((a, b) => a.leftPercent - b.leftPercent);
+            models.push({
+              id: cat.id,
+              shortLabel: cat.shortLabel,
+              label: cat.label,
+              leftPercent: items[0].leftPercent,
+              resetsAt: items[0].resetsAt
+            });
+          }
+        }
+
+        const summary = formatGeminiStatusSummary(models);
+        const raw = models.length > 0
+          ? models.map((m) => `${m.shortLabel} left ${m.leftPercent}% (reset ${formatReset(m.resetsAt)})`).join(' | ')
+          : 'No Gemini quota buckets';
+
+        return {
+          ok: true,
+          summary,
+          raw,
+          sourceLabel: 'Source: Antigravity Local Language Server',
+          geminiModels: models,
+        };
+      }
+    }
+    return null;
+  } catch (err) {
+    output?.appendLine(`[gemini:local] error: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+function detectAntigravityProcess(output) {
+  return new Promise((resolve) => {
+    const isWin = process.platform === 'win32';
+    const cmd = isWin
+      ? `powershell -ExecutionPolicy Bypass -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'language_server|antigravity' } | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"`
+      : `ps -A -ww -o pid,ppid,args | grep -i "language_server\\|antigravity" | grep -v grep`;
+
+    exec(cmd, { timeout: 4000 }, (err, stdout) => {
+      if (!err && stdout) {
+        if (isWin) {
+          try {
+            const parsed = JSON.parse(stdout.trim());
+            const list = Array.isArray(parsed) ? parsed : [parsed];
+            for (const item of list) {
+              const cStr = item.CommandLine || '';
+              const csrfMatch = cStr.match(/--csrf_token[=\s]+(?:["']?)([a-zA-Z0-9\-_.]+)(?:["']?)/);
+              const portMatch = cStr.match(/--extension_server_port[=\s]+(\d+)/);
+              if (csrfMatch) {
+                return resolve({ pid: item.ProcessId, csrfToken: csrfMatch[1], extensionPort: portMatch ? parseInt(portMatch[1], 10) : null });
+              }
+            }
+          } catch (e) {}
+        } else {
+          const lines = stdout.split('\n');
+          for (const line of lines) {
+            const csrfMatch = line.match(/--csrf_token[=\s]+(?:["']?)([a-zA-Z0-9\-_.]+)(?:["']?)/);
+            const portMatch = line.match(/--extension_server_port[=\s]+(\d+)/);
+            if (csrfMatch) {
+              const pidMatch = line.trim().match(/^(\d+)/);
+              return resolve({ pid: pidMatch ? parseInt(pidMatch[1], 10) : null, csrfToken: csrfMatch[1], extensionPort: portMatch ? parseInt(portMatch[1], 10) : null });
+            }
+          }
+        }
+      }
+
+      if (isWin) {
+        const wmicCmd = `wmic process where "name like '%language_server%' or name like '%antigravity%'" get ProcessId,CommandLine /format:csv`;
+        exec(wmicCmd, { timeout: 4000 }, (err2, stdout2) => {
+          if (stdout2) {
+            const lines = stdout2.split(/\r?\n/);
+            for (const line of lines) {
+              const csrfMatch = line.match(/--csrf_token[=\s]+(?:["']?)([a-zA-Z0-9\-_.]+)(?:["']?)/);
+              const portMatch = line.match(/--extension_server_port[=\s]+(\d+)/);
+              if (csrfMatch) {
+                const parts = line.trim().split(',');
+                const pidVal = parseInt(parts[parts.length - 1], 10);
+                return resolve({ pid: isNaN(pidVal) ? null : pidVal, csrfToken: csrfMatch[1], extensionPort: portMatch ? parseInt(portMatch[1], 10) : null });
+              }
+            }
+          }
+          resolve(null);
+        });
+      } else {
+        resolve(null);
+      }
+    });
+  });
+}
+
+function getListeningPortsForPid(pid, extensionPort, output) {
+  return new Promise((resolve) => {
+    const ports = [];
+    if (extensionPort) ports.push(extensionPort);
+    if (!pid) return resolve([...new Set(ports)]);
+
+    const isWin = process.platform === 'win32';
+    const cmd = isWin
+      ? `powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -OwningProcess ${pid} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort"`
+      : `lsof -a -p ${pid} -i 4TCP -a -sTCP:LISTEN`;
+
+    exec(cmd, { timeout: 4000 }, (err, stdout) => {
+      if (stdout) {
+        if (isWin) {
+          const lines = stdout.trim().split(/\r?\n/);
+          for (const line of lines) {
+            const p = parseInt(line.trim(), 10);
+            if (p > 0 && p <= 65535) ports.push(p);
+          }
+        } else {
+          const lines = stdout.split('\n');
+          for (const line of lines) {
+            const m = line.match(/:(\d+)\s+\(LISTEN\)/);
+            if (m) {
+              const p = parseInt(m[1], 10);
+              if (p > 0 && p <= 65535) ports.push(p);
+            }
+          }
+        }
+      }
+
+      if (isWin && ports.length <= (extensionPort ? 1 : 0)) {
+        exec(`netstat -ano | findstr LISTENING | findstr ${pid}`, { timeout: 3000 }, (err2, stdout2) => {
+          if (stdout2) {
+            const lines = stdout2.split(/\r?\n/);
+            for (const line of lines) {
+              const m = line.match(/:(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]):?(\d+)/i) || line.match(/:(\d+)\s+/);
+              if (m) {
+                const p = parseInt(m[1], 10);
+                if (p > 0 && p <= 65535) ports.push(p);
+              }
+            }
+          }
+          resolve([...new Set(ports)]);
+        });
+      } else {
+        resolve([...new Set(ports)]);
+      }
+    });
+  });
+}
+
+function requestAntigravityGetUserStatus(port, csrfToken) {
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({ metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' } });
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: port,
+      path: '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Connect-Protocol-Version': '1',
+        'X-Codeium-Csrf-Token': csrfToken
+      },
+      timeout: 2500
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try {
+            resolve({ port, ok: true, data: JSON.parse(data) });
+          } catch (e) {
+            resolve({ port, ok: false, error: 'JSON parse' });
+          }
+        } else {
+          resolve({ port, ok: false, status: res.statusCode });
+        }
+      });
+    });
+    req.on('error', (e) => resolve({ port, ok: false, error: e.message }));
+    req.write(postData);
+    req.end();
+  });
+}
+
 async function fetchGeminiUsage(output) {
   try {
+    const localResult = await fetchAntigravityLocalQuota(output);
+    if (localResult && localResult.ok) {
+      return localResult;
+    }
+
     if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
       return {
         ok: true,
@@ -1742,9 +1974,11 @@ async function fetchGeminiUsage(output) {
 
     const executeWithRetry = async () => {
       try {
-        const projectId = await fetchGeminiProjectId(accessToken);
-        if (!projectId) {
-          return { ok: false, error: 'Gemini project id unavailable' };
+        let projectId = null;
+        try {
+          projectId = await fetchGeminiProjectId(accessToken);
+        } catch (e) {
+          output.appendLine(`[gemini:project] fetch project id warning: ${e}`);
         }
         return await fetchGeminiQuotaBuckets(accessToken, projectId);
       } catch (err) {
@@ -1759,9 +1993,11 @@ async function fetchGeminiUsage(output) {
         }
         accessToken = refreshed;
         output.appendLine('[gemini:auth] refresh after auth error succeeded');
-        const retryProjectId = await fetchGeminiProjectId(accessToken);
-        if (!retryProjectId) {
-          throw new Error('Gemini project id unavailable after token refresh');
+        let retryProjectId = null;
+        try {
+          retryProjectId = await fetchGeminiProjectId(accessToken);
+        } catch (e) {
+          output.appendLine(`[gemini:project] retry fetch project id warning: ${e}`);
         }
         return await fetchGeminiQuotaBuckets(accessToken, retryProjectId);
       }
@@ -1781,125 +2017,6 @@ async function fetchGeminiUsage(output) {
       raw,
       sourceLabel: 'Source: Gemini Code Assist API',
       geminiModels: models,
-    };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-async function fetchKimiUsage(output) {
-  try {
-    const cfg = getConfig();
-    const credPath = expandHome(cfg.kimiCredentialsPath);
-    
-    // Check for Kimi CLI credentials
-    if (!fs.existsSync(credPath)) {
-      return { ok: false, error: `Missing ${credPath}. Run 'kimi login' first.` };
-    }
-
-    const creds = JSON.parse(fs.readFileSync(credPath, 'utf8'));
-    const accessToken = creds?.access_token;
-    
-    if (!accessToken) {
-      return { ok: false, error: "No Kimi access token found. Run 'kimi login' first." };
-    }
-
-    // Check token expiry
-    const expiresAt = creds?.expires_at;
-    if (expiresAt) {
-      const expiresMs = expiresAt > 1e12 ? expiresAt : expiresAt * 1000;
-      if (Date.now() >= expiresMs - 60000) {
-        return { ok: false, error: "Kimi token expired. Run 'kimi login' to refresh." };
-      }
-    }
-
-    output.appendLine('[run:kimi] GET /models');
-    
-    // Fetch models to get rate limits from headers
-    const result = await new Promise((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: 'api.kimi.com',
-          path: '/coding/v1/models',
-          method: 'GET',
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-          },
-        },
-        (res) => {
-          let raw = '';
-          res.on('data', (chunk) => { raw += chunk; });
-          res.on('end', () => {
-            if (res.statusCode === 401) {
-              reject(new Error('Unauthorized (401) - Token expired or invalid'));
-              return;
-            }
-            if (res.statusCode !== 200) {
-              reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`));
-              return;
-            }
-            
-            // Parse rate limits from headers
-            const limitRequests = res.headers['x-ratelimit-limit-requests'];
-            const remainingRequests = res.headers['x-ratelimit-remaining-requests'];
-            const resetRequests = res.headers['x-ratelimit-reset-requests'];
-            
-            let models = [];
-            try {
-              const data = JSON.parse(raw);
-              models = data.data || [];
-            } catch (_e) { /* ignore */ }
-            
-            resolve({
-              limitRequests,
-              remainingRequests,
-              resetRequests,
-              modelCount: models.length,
-            });
-          });
-        }
-      );
-      req.on('error', reject);
-      req.setTimeout(KIMI_TIMEOUT_MS, () => {
-        req.destroy(new Error('Request timed out'));
-      });
-      req.end();
-    });
-
-    const limit = result.limitRequests ? parseInt(result.limitRequests, 10) : null;
-    const remaining = result.remainingRequests ? parseInt(result.remainingRequests, 10) : null;
-    const leftPercent = (limit && remaining !== null) ? Math.round((remaining / limit) * 100) : null;
-    
-    // Format summary for status bar
-    let summary;
-    if (leftPercent !== null) {
-      summary = `${leftPercent}%`;
-    } else if (result.remainingRequests) {
-      summary = `${result.remainingRequests}`;
-    } else {
-      summary = 'OK';
-    }
-
-    const raw = `Kimi: ${remaining !== null ? remaining : '?'}/${limit !== null ? limit : '?'} requests remaining`;
-    
-    return {
-      ok: true,
-      summary,
-      raw,
-      sourceLabel: 'Source: Kimi API',
-      rateLimits: {
-        primary: {
-          used_percent: leftPercent !== null ? 100 - leftPercent : null,
-          resets_at: result.resetRequests ? parseInt(result.resetRequests, 10) : null,
-        },
-        secondary: null,
-      },
-      kimiInfo: {
-        modelCount: result.modelCount,
-        limitRequests: result.limitRequests,
-        remainingRequests: result.remainingRequests,
-      },
     };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -2104,19 +2221,19 @@ function buildGeminiModelsFromBuckets(buckets) {
       id: 'pro',
       shortLabel: 'P',
       label: 'Pro',
-      ids: ['gemini-2.5-pro', 'gemini-3.1-pro-preview'],
+      ids: ['gemini-2.5-pro', 'gemini-3-pro', 'gemini-3.0-pro', 'gemini-3.1-pro', 'gemini-3.1-pro-preview'],
     },
     {
       id: 'flash',
       shortLabel: 'F',
       label: 'Flash',
-      ids: ['gemini-2.5-flash', 'gemini-3-flash-preview'],
+      ids: ['gemini-2.5-flash', 'gemini-3-flash', 'gemini-3.0-flash', 'gemini-3.1-flash', 'gemini-3-flash-preview'],
     },
     {
       id: 'flash-lite',
       shortLabel: 'FL',
       label: 'Flash Lite',
-      ids: ['gemini-2.5-flash-lite'],
+      ids: ['gemini-2.5-flash-lite', 'gemini-3-flash-lite', 'gemini-3.0-flash-lite', 'gemini-3.1-flash-lite'],
     },
   ];
 
@@ -2329,14 +2446,17 @@ function expandHome(inputPath) {
 function getOpenCodeAuthCandidatePaths() {
   const home = os.homedir();
   const candidates = [
+    path.join(home, '.codex', 'auth.json'),
     path.join(home, '.local', 'share', 'opencode', 'auth.json'),
     path.join(home, 'Library', 'Application Support', 'opencode', 'auth.json'),
   ];
   if (process.env.APPDATA) {
     candidates.push(path.join(process.env.APPDATA, 'opencode', 'auth.json'));
+    candidates.push(path.join(process.env.APPDATA, 'codex', 'auth.json'));
   }
   if (process.env.LOCALAPPDATA) {
     candidates.push(path.join(process.env.LOCALAPPDATA, 'opencode', 'auth.json'));
+    candidates.push(path.join(process.env.LOCALAPPDATA, 'codex', 'auth.json'));
   }
   return [...new Set(candidates)];
 }
@@ -2346,9 +2466,33 @@ function readOpenAiWebAuth() {
     try {
       if (!fs.existsSync(authPath)) continue;
       const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+
+      if (auth?.tokens?.access_token) {
+        return {
+          type: 'oauth',
+          access: auth.tokens.access_token,
+          expires: auth.tokens.expires_in ? Date.now() + auth.tokens.expires_in * 1000 : null,
+          account_id: auth.tokens.account_id,
+        };
+      }
+
+      if (auth?.access_token || auth?.access) {
+        const access = auth.access_token || auth.access;
+        return {
+          type: 'oauth',
+          access,
+          account_id: auth.account_id,
+        };
+      }
+
       const token = auth?.codex || auth?.openai || auth?.chatgpt || auth?.opencode;
-      if (token?.type === 'oauth' && token?.access) {
-        return token;
+      if (token?.access) {
+        return {
+          type: 'oauth',
+          access: token.access,
+          expires: token.expires,
+          account_id: token.account_id || auth?.account_id,
+        };
       }
     } catch (_err) {
       // Try the next candidate path.
@@ -2548,7 +2692,7 @@ function buildClaudeRateLimitsFromLocalTokenCount(projectsRoot, credPath, output
 
     const rateLimits = {
       primary: { used_percent: usedPercent, resets_at: resetsAtSec },
-      secondary: null,
+      secondary: { used_percent: 0, resets_at: null },
     };
     const summary = formatRateLimitSingleWindowSummary(rateLimits);
     const raw = `Claude session tokens: ${usedTokens.toLocaleString()} / ${planLimit.toLocaleString()}`;
@@ -3138,11 +3282,16 @@ function formatLeftPercent(usedPercent) {
 }
 
 function normalizeUtilizationToUsedPercent(utilization) {
-  if (typeof utilization !== 'number') {
+  if (typeof utilization !== 'number' || Number.isNaN(utilization)) {
     return null;
   }
-  const raw = utilization <= 1 ? utilization * 100 : utilization;
-  return Math.max(0, Math.min(100, raw));
+  // If utilization is a small positive fraction (e.g. 0.01 < x < 1), convert from fraction to percent.
+  // Integer values >= 1 (e.g. 1, 2, 50, 100) and 0 are already percent values.
+  let raw = utilization;
+  if (utilization > 0 && utilization < 1) {
+    raw = utilization * 100;
+  }
+  return Math.max(0, Math.min(100, Math.round(raw * 10) / 10));
 }
 
 function isoToEpochSeconds(value) {
