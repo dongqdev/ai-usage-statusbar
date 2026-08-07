@@ -2,6 +2,8 @@
 
 AI usage for Codex, Claude, Copilot, and Gemini is shown in the VS Code status bar, with a sidebar panel for detailed usage and provider controls.
 
+> One glance at the status bar tells you how much AI usage you have left.
+
 ## Features
 
 - Status bar usage summary for:
